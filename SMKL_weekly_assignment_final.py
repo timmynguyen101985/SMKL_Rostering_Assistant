@@ -284,12 +284,12 @@ def main():
 
     console.print("\nSelect your weekly Excel schedule file (rows 14–90, cols D–L):",style=COLOR_TEXT)
     uploaded_file = st.file_uploader("📘 Upload your weekly Excel schedule (rows 14–90, cols D–L):", type=["xlsx", "xls"])
-
+	
 	if uploaded_file is None:
     st.warning("Please upload a file to continue.")
     st.stop()
 
-	path = uploaded_file
+    path = uploaded_file
 
     if not path:
         console.print("[bold red]No file selected. Exiting.[/bold red]"); input(); return
@@ -511,4 +511,5 @@ if __name__=="__main__":
         console.print("[bold red]Unexpected error:[/bold red]",str(e))
         console.print(traceback.format_exc(),style="dim")
         input("\nPress Enter to exit...")
+
 
