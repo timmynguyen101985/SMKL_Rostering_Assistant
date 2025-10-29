@@ -24,11 +24,22 @@ from datetime import datetime, timedelta, date
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
-import tkinter as tk
-from tkinter import filedialog
+# import tkinter as tk
+# from tkinter import filedialog
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+import streamlit as st
+
+st.title("📘 SMKL Dispatch Assistant — Web Version")
+uploaded_file = st.file_uploader("Upload your weekly Excel schedule", type=["xlsx"])
+
+if uploaded_file:
+    df = pd.read_excel(uploaded_file, engine="openpyxl")
+    st.success("✅ File uploaded successfully!")
+else:
+    st.warning("Please upload a file to continue.")
+
 
 warnings.filterwarnings(
     "ignore",
