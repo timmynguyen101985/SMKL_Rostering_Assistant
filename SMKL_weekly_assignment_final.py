@@ -1,521 +1,494 @@
-"""
-SMKL_weekly_assignment_v10.py
-
-Lightweight dispatch assignment generator
-- Full week (Sun–Sat), calm console UI
-- No JSON / snapshots
-- Enforces DOT weekly limits (max 2 per week across DOT / DOT-HelperRoute / DOT-Helper)
-  * Standby and XL DO NOT count toward the DOT limit
-- Prioritizes giving every DOT driver at least one step-van slot weekly
-- New drivers are always assigned to XL
-- Standby capped to 2 per driver per week
-- Writes per-day sheets, updates weekly schedule (replaces '1'/'DOT' with labels + colors)
-- Clean and simple output
-"""
-
-# =========================
-# 🔹 IMPORTS & CONSTANTS
-# =========================
-import os
+import io
 import random
-import time
-import warnings
 from datetime import datetime, timedelta, date
+
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
-# import tkinter as tk
-# from tkinter import filedialog
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
 
+# -------------------------------
+# App Title / Header / Reset
+# -------------------------------
+st.set_page_config(page_title="SMKL Scheduling Assistant", layout="wide")
+left, right = st.columns([0.8, 0.2])
+with left:
+    st.markdown("## SMKL Scheduling Assistant — Designed by Timmy Nguyen 😎")
+with right:
+    if st.button("🔄 Reset / Start Over", use_container_width=True):
+        st.experimental_rerun()
 
-st.title("📘 SMKL Dispatch Assistant — Web Version")
-uploaded_file = st.file_uploader("Upload your weekly Excel schedule", type=["xlsx"])
+st.write("Upload your weekly schedule and enter counts per day. This app will assign routes, "
+         "enforce step-van fairness for DOT drivers, cap Standby at 2 per week, and export a "
+         "color-coded Excel workbook with daily sheets + Fairness_Audit (if swaps occurred).")
 
-if uploaded_file:
-    df = pd.read_excel(uploaded_file, engine="openpyxl")
-    st.success("✅ File uploaded successfully!")
-else:
-    st.warning("Please upload a file to continue.")
-
-
-warnings.filterwarnings(
-    "ignore",
-    message="Unknown extension is not supported and will be removed",
-    category=UserWarning
-)
-
-console = Console()
-
-# Layout constants
-SKIPROWS = 13
+# -------------------------------
+# Constants / Layout
+# -------------------------------
+SKIPROWS = 13            # rows 14..90 inclusive
 NROWS = 90 - 14 + 1
-COL_FIRST = 3
-COL_LAST = 4
-COL_DAY_START = 5
+COL_FIRST = 3            # D
+COL_LAST  = 4            # E
+COL_DAY_START = 5        # F is Sunday
 DAY_NAMES = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
 
-# Calm UI colors
-COLOR_TEXT  = "#E0E0E6"
-COLOR_HEADER= "#A3BE8C"
+# Caps / Rules
+STANDBY_CAP = 2
+MAX_DOT_WEEK = 2   # Counts DOT / DOT-HelperRoute / DOT-Helper. XL & Standby don't count.
+ENFORCE_MAX_DOT = True  # Set False if you want fairness only.
 
-# Excel cell fills
-FILL_DOT        = PatternFill(start_color="C5E1A5", end_color="C5E1A5", fill_type="solid")
-FILL_DOT_HR     = PatternFill(start_color="A5D6A7", end_color="A5D6A7", fill_type="solid")
-FILL_HELPER     = PatternFill(start_color="81D4FA", end_color="81D4FA", fill_type="solid")
-FILL_XL         = PatternFill(start_color="FFF59D", end_color="FFF59D", fill_type="solid")
-FILL_STANDBY    = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+# Colors
+FILL_DOT        = PatternFill(start_color="C5E1A5", end_color="C5E1A5", fill_type="solid")  # light green
+FILL_DOT_HR     = PatternFill(start_color="A5D6A7", end_color="A5D6A7", fill_type="solid")  # darker green
+FILL_HELPER     = PatternFill(start_color="81D4FA", end_color="81D4FA", fill_type="solid")  # light blue
+FILL_XL         = PatternFill(start_color="FFF59D", end_color="FFF59D", fill_type="solid")  # yellow
+FILL_STANDBY    = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")  # grey
+HEADER_FILL     = PatternFill(start_color="E3F2FD", end_color="E3F2FD", fill_type="solid")  # banner
+BOLD_FONT       = Font(bold=True)
 
-ASSIGN_LABEL_TO_TEXT = {
-    "DOT": "DOT Route",
-    "DOT-HelperRoute": "DOT-HelperRoute",
-    "DOT-Helper": "DOT-Helper",
-    "XL": "XL",
-    "Standby": "Standby"
-}
 ASSIGN_LABEL_TO_FILL = {
     "DOT": FILL_DOT,
     "DOT-HelperRoute": FILL_DOT_HR,
     "DOT-Helper": FILL_HELPER,
     "XL": FILL_XL,
-    "Standby": FILL_STANDBY
+    "Standby": FILL_STANDBY,
 }
-ASSIGN_PRIORITY = ["DOT-HelperRoute","DOT","DOT-Helper","XL","Standby"]
 
-# =========================
-# 🗂️ UTILITIES
-# =========================
-
-def safe_sheet_name(name):
-    invalid = '[]:*?/\\'
-    return ''.join('_' if c in invalid else c for c in name)[:31]
-
-def week_start_for(d:date):
-    return d - timedelta(days=(d.weekday()+1)%7)
-
-def read_schedule_df(path):
-    xls = pd.ExcelFile(path, engine="openpyxl")
+# -------------------------------
+# Helpers
+# -------------------------------
+def read_schedule_df(uploaded_file):
+    # First sheet only; sheet shape is fixed by your template
+    xls = pd.ExcelFile(uploaded_file)
     sheet = xls.sheet_names[0]
-    return pd.read_excel(path, sheet_name=sheet, header=None,
-                         skiprows=SKIPROWS, nrows=NROWS, engine="openpyxl"), sheet
+    df = pd.read_excel(uploaded_file, sheet_name=sheet, header=None,
+                       skiprows=SKIPROWS, nrows=NROWS, engine="openpyxl")
+    return df
 
-def save_df_to_sheet(workbook_path, df, sheet_name):
-    book = load_workbook(workbook_path)
-    if sheet_name in book.sheetnames:
-        del book[sheet_name]; book.save(workbook_path)
-    with pd.ExcelWriter(workbook_path, engine="openpyxl", mode="a") as w:
-        df.to_excel(w, sheet_name=sheet_name, index=False)
-
-def safe_save_workbook(wb, path):
-    try:
-        wb.save(path)
-        return True
-    except PermissionError:
-        console.print(f"[bold red]❌ Close the Excel file before running the program again.[/bold red]")
-        return False
-
-# =========================
-# 🧩 DRIVER LOGIC
-# =========================
 def build_driver_records(df):
-    drivers=[]
+    drivers = []
     for _, row in df.iterrows():
-        first=str(row[COL_FIRST]).strip() if not pd.isna(row[COL_FIRST]) else ""
-        last=str(row[COL_LAST]).strip() if not pd.isna(row[COL_LAST]) else ""
-        if not first and not last: continue
-        days={DAY_NAMES[i]:row[COL_DAY_START+i] for i in range(len(DAY_NAMES))}
-        drivers.append({"name":f"{first} {last}".strip(),"days":days})
+        first = str(row[COL_FIRST]).strip() if not pd.isna(row[COL_FIRST]) else ""
+        last  = str(row[COL_LAST]).strip()  if not pd.isna(row[COL_LAST])  else ""
+        if not first and not last:
+            continue
+        days = {DAY_NAMES[i]: row[COL_DAY_START + i] for i in range(7)}
+        drivers.append({"name": f"{first} {last}".strip(), "days": days})
     return drivers
 
-def infer_dot_cert(driver):
-    for v in driver["days"].values():
-        if pd.isna(v): continue
-        if str(v).strip().lower()=="dot": return True
-    return False
+def infer_dot_map(drivers):
+    dot_map = {}
+    for d in drivers:
+        is_dot = any((not pd.isna(v)) and str(v).strip().lower() == "dot"
+                     for v in d["days"].values())
+        dot_map[d["name"]] = is_dot
+    return dot_map
 
-def scheduled_on_day(driver,day):
-    v=driver["days"].get(day)
-    if pd.isna(v): return False
-    s=str(v).strip().lower()
-    return s in ("1","dot")
+def scheduled_on_day(driver, day):
+    v = driver["days"].get(day)
+    if pd.isna(v):
+        return False
+    s = str(v).strip().lower()
+    return s in ("1", "dot")
 
-def prioritize_and_sample(pool,need,priority=None):
-    if need<=0: return []
-    chosen=[]
-    if priority:
-        pri = [n for n in priority if n in pool]
-        random.shuffle(pri)
-        take=min(len(pri),need)
-        chosen.extend(pri[:take])
-    remaining=need-len(chosen)
-    if remaining>0:
-        rest=[n for n in pool if n not in chosen]
-        random.shuffle(rest)
-        chosen.extend(rest[:remaining])
-    return chosen
+def week_start_from_weeknum(week_num, year=None):
+    if year is None:
+        year = datetime.today().year
+    monday = datetime.fromisocalendar(year, int(week_num), 1).date()
+    return monday - timedelta(days=1)  # Sunday
 
-# =========================
-# 🔁 GENERATION LOGIC
-# =========================
-def generate_day_assignments(drivers, dot_map, new_list, semi, counts, target_date,
-                             dot_weekly_count, dot_stepvan_count, standby_tracker):
-    day_idx=(target_date.weekday()+1)%7
-    day_name=DAY_NAMES[day_idx]
-    scheduled=[d["name"] for d in drivers if scheduled_on_day(d,day_name)]
-    new_sched=[n for n in new_list if n in scheduled]
+def choose(pool, k):
+    if k <= 0:
+        return []
+    pool2 = pool[:]  # copy
+    random.shuffle(pool2)
+    return pool2[:k]
 
-    all_avail=list(dict.fromkeys(scheduled+new_sched))
-    dot_avail=[n for n in all_avail if dot_map.get(n,False) and n not in semi]
+# -------------------------------
+# Fairness & Assignment Engine
+# -------------------------------
+def generate_week(drivers, dot_map, new_drivers, semi_restricted, week_dates, daily_counts):
+    """
+    Returns:
+      - day_assignments: dict day_idx -> dict{ group -> [names], 'Pairings': [(driver, helper)] }
+      - swaps_log: list of text lines describing fairness swaps
+      - day_summaries: list of dict rows for the UI table
+    """
+    # Trackers
+    dot_weekly_count = {n: 0 for n, isdot in dot_map.items() if isdot}
+    stepvan_count    = {n: 0 for n, isdot in dot_map.items() if isdot}  # DOT or DOT-HelperRoute
+    standby_count    = {}  # all drivers
 
-    # --- New Drivers get XL ---
-    xl_assigned=[]
-    need_xl=counts.get("xl",0)
-    take_new=min(len(new_sched),need_xl)
-    if take_new>0:
-        random.shuffle(new_sched)
-        xl_assigned.extend(new_sched[:take_new])
-        need_xl-=take_new
-    unassigned_new=[n for n in new_sched if n not in xl_assigned]
+    day_assignments = {}
+    day_summaries = []
+    swaps_log = []
 
-    # --- DOT step-van logic ---
-    eligible_dot=[n for n in dot_avail if dot_weekly_count.get(n,0)<2]
-    zero_step=[n for n in eligible_dot if dot_stepvan_count.get(n,0)==0]
-    one_step=[n for n in eligible_dot if dot_stepvan_count.get(n,0)==1]
-    dot_priority=zero_step+one_step
+    # First pass: day-by-day assignment
+    for idx, dt in enumerate(week_dates):
+        day_name = DAY_NAMES[(dt.weekday() + 1) % 7]
+        counts = daily_counts[idx]  # dict with dot, dot_hr, dot_h, xl
+        scheduled = [d["name"] for d in drivers if scheduled_on_day(d, day_name)]
 
-    dot_assigned=prioritize_and_sample(eligible_dot,counts.get("dot",0),priority=dot_priority)
-    remaining_dot=[n for n in eligible_dot if n not in dot_assigned]
-    zero_step2=[n for n in remaining_dot if dot_stepvan_count.get(n,0)==0]
-    one_step2=[n for n in remaining_dot if dot_stepvan_count.get(n,0)==1]
-    helperroute_assigned=prioritize_and_sample(remaining_dot,counts.get("dot_helperroute",0),
-                                               priority=zero_step2+one_step2)
+        # Pools
+        new_sched = [n for n in new_drivers if n in scheduled]
+        dot_avail = [n for n in scheduled if dot_map.get(n, False) and (n not in semi_restricted)]
+        helpers_avail = [n for n in scheduled]  # helpers can be anyone scheduled
 
-    helper_pool=[n for n in scheduled if n not in dot_assigned+helperroute_assigned+xl_assigned]
-    helper_assigned=prioritize_and_sample(helper_pool,counts.get("dot_helper",0))
+        # Enforce weekly DOT cap by filtering (optional)
+        if ENFORCE_MAX_DOT:
+            dot_avail = [n for n in dot_avail if dot_weekly_count.get(n, 0) < MAX_DOT_WEEK]
 
-    for n in dot_assigned+helperroute_assigned:
-        if dot_map.get(n,False): dot_weekly_count[n]+=1; dot_stepvan_count[n]+=1
-    for n in helper_assigned:
-        if dot_map.get(n,False): dot_weekly_count[n]+=1
+        # Prioritize DOT with fewer step-van so far
+        zero_step = [n for n in dot_avail if stepvan_count.get(n, 0) == 0]
+        one_step  = [n for n in dot_avail if stepvan_count.get(n, 0) == 1]
+        more_step = [n for n in dot_avail if stepvan_count.get(n, 0) >= 2]
+        dot_priority = zero_step + one_step + more_step
 
-    # --- Remaining XL ---
-    if need_xl>0:
-        remain=[n for n in scheduled if n not in dot_assigned+helperroute_assigned+helper_assigned+xl_assigned]
-        random.shuffle(remain)
-        xl_assigned.extend(remain[:need_xl])
+        # Assign DOT and DOT-HelperRoute
+        dot_assigned = []
+        dot_needed = counts["dot"]
+        for n in dot_priority:
+            if len(dot_assigned) >= dot_needed:
+                break
+            dot_assigned.append(n)
 
-    # --- Standby capped at 2 per week ---
-    assigned_now=set(dot_assigned+helperroute_assigned+helper_assigned+xl_assigned)
-    standby_candidates=[n for n in scheduled if n not in assigned_now]
-    standby=[]
-    for n in standby_candidates:
-        if standby_tracker.get(n,0)<2:
-            standby.append(n)
-            standby_tracker[n]=standby_tracker.get(n,0)+1
+        rem_dot_pool = [n for n in dot_priority if n not in dot_assigned]
+        dot_hr_assigned = choose(rem_dot_pool, counts["dot_hr"])
 
-    # --- Pair DOT-HelperRoute with helpers ---
-    pairs=[]
-    helpers_for_pair=helper_assigned.copy()
-    random.shuffle(helpers_for_pair)
-    for d in helperroute_assigned:
-        h=helpers_for_pair.pop(0) if helpers_for_pair else None
-        pairs.append((d,h))
+        # Helpers (1:1 pairing for helperroute will be done after selecting helpers)
+        # First choose helpers that are not already DOT step-van drivers this day
+        occupied = set(dot_assigned + dot_hr_assigned)
+        helpers_pool = [n for n in helpers_avail if n not in occupied]
+        dot_h_assigned = choose(helpers_pool, counts["dot_h"])
 
-    return {
-        "DOT": dot_assigned,
-        "DOT-HelperRoute": helperroute_assigned,
-        "DOT-Helper": helper_assigned,
-        "XL": xl_assigned,
-        "Standby": standby,
-        "Unassigned_New": unassigned_new,
-        "Pairings": pairs
-    }, dot_weekly_count, standby_tracker
+        # Update DOT weekly counters
+        for n in dot_assigned + dot_hr_assigned:
+            if dot_map.get(n, False):
+                dot_weekly_count[n] = dot_weekly_count.get(n, 0) + 1
+                stepvan_count[n]    = stepvan_count.get(n, 0) + 1
+        for n in dot_h_assigned:
+            if dot_map.get(n, False):
+                dot_weekly_count[n] = dot_weekly_count.get(n, 0) + 1
 
-# =========================
-# 🖋️ SHEET UPDATES
-# =========================
-def build_day_label_map(assignments):
-    label_map={}
-    for d,h in assignments.get("Pairings",[]):
-        if d: label_map[d]="DOT-HelperRoute"
-    for label in ASSIGN_PRIORITY:
-        if label=="DOT-HelperRoute": continue
-        for n in assignments.get(label,[]):
-            if n not in label_map:
-                label_map[n]=label
-    for n in assignments.get("Unassigned_New",[]):
-        label_map[n]="Unassigned (Need XL)"
-    return label_map
+        # XL: new scheduled first, then others scheduled
+        occupied = set(dot_assigned + dot_hr_assigned + dot_h_assigned)
+        xl_assigned = []
+        need_xl = counts["xl"]
 
-def update_schedule_with_assignments(source_path,target_path,day_maps):
-    wb=load_workbook(source_path)
-    ws=wb[wb.sheetnames[0]]
-    for r in range(14,91):
-        first=ws.cell(r,4).value; last=ws.cell(r,5).value
-        if not first and not last: continue
-        name=f"{str(first).strip()} {str(last).strip()}".strip()
-        for day_idx,c in enumerate(range(6,13)):
-            cell=ws.cell(r,c); v=cell.value
-            s=str(v).strip().lower() if v else ""
-            if s in ("1","dot"):
-                label=day_maps.get(day_idx,{}).get(name)
-                if label:
-                    cell.value=ASSIGN_LABEL_TO_TEXT.get(label,label)
-                    fill=ASSIGN_LABEL_TO_FILL.get(label)
-                    if fill: cell.fill=fill
-    safe_save_workbook(wb,target_path)
+        take_new = min(len(new_sched), need_xl)
+        if take_new > 0:
+            xl_assigned.extend(choose(new_sched, take_new))
+            need_xl -= take_new
 
-# =========================
-# 🚀 MAIN
-# =========================
-def main():
-    console.clear()
-    banner = (
-        f"🌙 {'━'*45} 🌙\n"
-        f"      SMKL Dispatch Assistant\n"
-        f"   “Plan smart. Drive safe. Rest easy.”\n"
-        f"   This program is designed by Timmy Nguyen 😎\n"
-        f"{'━'*55}"
-    )
-    console.print(Markdown(f"```{banner}```"))
+        if need_xl > 0:
+            remaining_sched = [n for n in scheduled if n not in occupied and n not in xl_assigned]
+            xl_assigned.extend(choose(remaining_sched, need_xl))
 
-    console.print("\nSelect your weekly Excel schedule file (rows 14–90, cols D–L):",style=COLOR_TEXT)
-    uploaded_file = st.file_uploader("📘 Upload your weekly Excel schedule (rows 14–90, cols D–L):", type=["xlsx", "xls"])
+        # Standby = scheduled not assigned anywhere
+        occupied = set(dot_assigned + dot_hr_assigned + dot_h_assigned + xl_assigned)
+        standby = [n for n in scheduled if n not in occupied]
 
-    if uploaded_file is None:
-        st.warning("Please upload a file to continue.")
+        # Pair DOT-HelperRoute with helpers from dot_h_assigned (1:1)
+        pairs = []
+        helpers_for_pair = dot_h_assigned[:]
+        random.shuffle(helpers_for_pair)
+        paired_helpers = []
+        for d in dot_hr_assigned:
+            h = helpers_for_pair.pop(0) if helpers_for_pair else None
+            if h:
+                pairs.append((d, h))
+                paired_helpers.append(h)
+
+        # Build assignments for the day
+        assignments = {
+            "DOT": dot_assigned,
+            "DOT-HelperRoute": dot_hr_assigned,
+            "DOT-Helper": dot_h_assigned,
+            "XL": xl_assigned,
+            "Standby": standby,
+            "Pairings": pairs
+        }
+        day_assignments[idx] = assignments
+
+        # Update standby counts
+        for n in standby:
+            standby_count[n] = standby_count.get(n, 0) + 1
+
+        # Save summary counts
+        day_summaries.append({
+            "Day": dt.strftime("%a %m/%d"),
+            "DOT": len(dot_assigned),
+            "DOT-HelperRoute": len(dot_hr_assigned),
+            "DOT-Helper": len(dot_h_assigned),
+            "XL": len(xl_assigned),
+            "Standby": len(standby),
+            "Scheduled": len(scheduled),
+            "Routes": len(dot_assigned) + len(dot_hr_assigned) + len(xl_assigned)
+        })
+
+    # -------------------------------
+    # Fairness: ensure each DOT driver gets ≥1 step-van this week
+    # -------------------------------
+    st.session_state.progress_text.write("✅ Step-van fairness: applying...")
+    unserved_dot = [n for n in stepvan_count if stepvan_count[n] == 0]
+    # Try to swap from days with step-van assignments
+    for driver in unserved_dot:
+        swapped = False
+        for idx, dt in enumerate(week_dates):
+            day_name = DAY_NAMES[(dt.weekday() + 1) % 7]
+            # driver must be scheduled that day
+            try:
+                drv_obj = next(d for d in drivers if d["name"] == driver)
+            except StopIteration:
+                continue
+            if not scheduled_on_day(drv_obj, day_name):
+                continue
+
+            # find someone to swap OUT of step-van that day (DOT or DOT-HR)
+            todays = day_assignments[idx]
+            candidates = todays["DOT"] + todays["DOT-HelperRoute"]
+            if not candidates:
+                continue
+
+            # Prefer candidate with stepvan_count >= 2
+            c_sorted = sorted(candidates, key=lambda x: -stepvan_count.get(x, 0))
+            for victim in c_sorted:
+                if victim == driver:
+                    continue
+                # Swap: give driver a step-van slot; move victim somewhere else (XL or Standby)
+                # Remove victim from whichever group they are in
+                if victim in todays["DOT"]:
+                    todays["DOT"].remove(victim)
+                    target_group = "DOT"
+                else:
+                    todays["DOT-HelperRoute"].remove(victim)
+                    target_group = "DOT-HelperRoute"
+
+                # Place driver into that group
+                todays[target_group].append(driver)
+                stepvan_count[driver] = stepvan_count.get(driver, 0) + 1
+
+                # Re-assign victim: try XL first, else Standby (respect standby cap)
+                if victim not in todays["XL"]:
+                    todays["XL"].append(victim)
+                # If standby cap exceeded later, we'll repair below
+
+                swaps_log.append(f"{dt.strftime('%a %m/%d')}: swapped in {driver} (step-van), moved {victim} to XL")
+                swapped = True
+                break
+            if swapped:
+                break
+
+    # -------------------------------
+    # Standby cap repair (≤2 per week per driver)
+    # -------------------------------
+    st.session_state.progress_text.write("✅ Standby cap: enforcing ≤ 2 per driver...")
+    # Recompute weekly standby tallies from day_assignments and fix violations
+    tally = {}
+    for idx in day_assignments:
+        for n in day_assignments[idx]["Standby"]:
+            tally[n] = tally.get(n, 0) + 1
+
+    # For anyone > 2, try moving them into XL (or DOT-Helper) where possible
+    for name, cnt in list(tally.items()):
+        while cnt > STANDBY_CAP:
+            # find a day they were standby and move them out if any slot free
+            moved = False
+            for idx in range(7):
+                if name in day_assignments[idx]["Standby"]:
+                    # Prefer XL
+                    day_assignments[idx]["Standby"].remove(name)
+                    day_assignments[idx]["XL"].append(name)
+                    cnt -= 1
+                    moved = True
+                    swaps_log.append(f"{week_dates[idx].strftime('%a %m/%d')}: reduced standby for {name} → moved to XL")
+                    break
+            if not moved:
+                # no move possible
+                break
+
+    # Done
+    return day_assignments, swaps_log, day_summaries
+
+
+def write_colored_workbook(day_assignments, week_dates, swaps_log, filename_bytes):
+    """
+    Build an Excel workbook with Sun..Sat sheets and an optional Fairness_Audit sheet.
+    Color code rows per group.
+    """
+    wb = Workbook()
+    # Remove default sheet
+    wb.remove(wb.active)
+
+    def add_sheet(title, rows):
+        ws = wb.create_sheet(title[:31])
+        # Header
+        ws.append(["Group", "Driver"])
+        for cell in ws[1]:
+            cell.font = BOLD_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = Alignment(horizontal="center")
+        # Data with fills
+        for group, driver in rows:
+            ws.append([group, driver])
+            r = ws.max_row
+            fill = ASSIGN_LABEL_TO_FILL.get(group)
+            if fill:
+                ws[f"A{r}"].fill = fill
+                ws[f"B{r}"].fill = fill
+        # Widths
+        ws.column_dimensions["A"].width = 22
+        ws.column_dimensions["B"].width = 34
+
+    # Create daily sheets
+    for idx, dt in enumerate(week_dates):
+        title = dt.strftime("%a %m_%d")
+        asg = day_assignments[idx]
+        rows = []
+        # Group order
+        for g in ["DOT", "DOT-HelperRoute", "DOT-Helper", "XL", "Standby"]:
+            rows.append((g, ""))  # header spacer row
+            for n in asg[g]:
+                rows.append((g, n))
+            rows.append(("", ""))  # blank spacer
+        add_sheet(title, rows)
+
+    # Fairness_Audit
+    if swaps_log:
+        ws = wb.create_sheet("Fairness_Audit")
+        ws.append(["Action"])
+        ws["A1"].font = BOLD_FONT
+        ws["A1"].fill = HEADER_FILL
+        for line in swaps_log:
+            ws.append([line])
+        ws.column_dimensions["A"].width = 80
+
+    # Write to BytesIO
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    filename_bytes.write(bio.getvalue())
+
+
+# -------------------------------
+# Sidebar Inputs
+# -------------------------------
+with st.sidebar:
+    st.markdown("### 1) Upload Weekly Excel")
+    uploaded = st.file_uploader("Excel (rows 14–90, cols D–L)", type=["xlsx"])
+
+    st.markdown("---")
+    st.markdown("### 2) Drivers")
+    new_drivers_text = st.text_area("New drivers (one per line)", height=120,
+                                    placeholder="Example:\nJohn Doe\nMaria Perez")
+    semi_text = st.text_area("Semi-restricted (no DOT / no DOT-HelperRoute)", height=120,
+                             placeholder="Example:\nAlex Pham\nNina Tran")
+
+    st.markdown("---")
+    st.markdown("### 3) Week Number")
+    week_num = st.number_input("Enter week number (ISO, e.g., 45)", min_value=1, max_value=53, value=45, step=1)
+
+    st.markdown("---")
+    st.markdown("### 4) Daily Route Counts")
+    counts = {}
+    for d in DAY_NAMES:
+        st.markdown(f"**{d}**")
+        dot  = st.number_input(f"{d} — DOT", min_value=0, value=3, step=1, key=f"{d}_dot")
+        dhr  = st.number_input(f"{d} — DOT-HelperRoute", min_value=0, value=3, step=1, key=f"{d}_dhr")
+        dh   = st.number_input(f"{d} — DOT-Helper", min_value=0, value=2, step=1, key=f"{d}_dh")
+        xl   = st.number_input(f"{d} — XL", min_value=0, value=10, step=1, key=f"{d}_xl")
+        counts[d] = {"dot": dot, "dot_hr": dhr, "dot_h": dh, "xl": xl}
+
+    st.markdown("---")
+    run_btn = st.button("🚀 Generate Week", type="primary", use_container_width=True)
+
+# Placeholders for progress and logs
+st.markdown("---")
+progress = st.progress(0)
+st.session_state.progress_text = st.empty()
+
+# -------------------------------
+# Run Generation
+# -------------------------------
+if run_btn:
+    if not uploaded:
+        st.error("Please upload the weekly Excel file.")
         st.stop()
 
-    path = uploaded_file
-
-
-    if not path:
-        console.print("[bold red]No file selected. Exiting.[/bold red]"); input(); return
-
-    df_raw = pd.read_excel(uploaded_file, header=None, skiprows=SKIPROWS, nrows=NROWS, engine="openpyxl")
-    drivers=build_driver_records(df_raw)
-    dot_map={d["name"]:infer_dot_cert(d) for d in drivers}
-
-    console.print("\nPaste new drivers (one per line). Press Enter immediately if none:",style=COLOR_TEXT)
-    new_list=[]
-    while True:
-        ln=input().strip()
-        if not ln: break
-        new_list.append(ln)
-
-    console.print("\n(Optional) Paste semi-restricted drivers (cannot do DOT/HelperRoute). Press Enter if none:",style=COLOR_TEXT)
-    semi=[]
-    while True:
-        ln=input().strip()
-        if not ln: break
-        semi.append(ln.strip())
-
-    console.print("\nEnter the week number (e.g., 45 for Week 45):", style=COLOR_TEXT)
     try:
-        week_input=int(input().strip())
-        today_year=datetime.today().year
-        wk_start=datetime.fromisocalendar(today_year,week_input,1).date()-timedelta(days=1)
-        console.print(f"[{COLOR_HEADER}]Week {week_input} detected: starting Sunday {wk_start}[/]")
-    except Exception:
-        console.print("[yellow]Invalid or blank input — defaulting to current week.[/yellow]")
-        wk_start=week_start_for(date.today())
-
-    week_dates=[wk_start+timedelta(days=i) for i in range(7)]
-    day_label_maps={}
-    dot_weekly_count={n:0 for n,is_dot in dot_map.items() if is_dot}
-    dot_stepvan_count={n:0 for n,is_dot in dot_map.items() if is_dot}
-    standby_tracker={}
-
-    console.print(f"\n[{COLOR_HEADER}]Starting full week generation...[/]")
-
-    for tgt in week_dates:
-        day_label=tgt.strftime("%a %m_%d")
-        console.print(f"\n[{COLOR_TEXT}]Generating assignments for [bold]{day_label}[/bold] ({tgt.isoformat()})[/{COLOR_TEXT}]")
-
-        try:
-            dot_hr=int(input("Number of DOT-HelperRoute: ").strip())
-            dot_h=int(input("Number of DOT-Helpers: ").strip())
-            dot_r=int(input("Number of DOT routes: ").strip())
-            xl=int(input("Number of XL routes: ").strip())
-        except Exception:
-            console.print("[bold red]Invalid input. Skipping this day.[/bold red]"); continue
-
-        counts={"dot_helperroute":dot_hr,"dot_helper":dot_h,"dot":dot_r,"xl":xl}
-        assignments, dot_weekly_count, standby_tracker=generate_day_assignments(
-            drivers,dot_map,new_list,semi,counts,tgt,dot_weekly_count,dot_stepvan_count,standby_tracker
-        )
-        day_idx=(tgt.weekday()+1)%7
-        day_label_maps[day_idx]=build_day_label_map(assignments)
-
-        def panel(title,names,emoji):
-            lines="\n".join(f"- {x}" for x in names) if names else "[dim](none)[/dim]"
-            return Panel(lines,title=f"{emoji} {title} ({len(names)})",expand=False)
-        console.print(panel("DOT Routes",assignments["DOT"],"🚛"))
-        console.print(panel("DOT-HelperRoute",assignments["DOT-HelperRoute"],"🚐"))
-        console.print(panel("DOT-Helper",assignments["DOT-Helper"],"🧑‍🤝‍🧑"))
-        console.print(panel("XL Routes",assignments["XL"],"📦"))
-        console.print(panel("Standby",assignments["Standby"],"💤"))
-        if assignments["Unassigned_New"]:
-            console.print(f"[yellow]⚠️ Unassigned new drivers (need XL): {', '.join(assignments['Unassigned_New'])}[/yellow]")
-
-        scheduled_count=len([d["name"] for d in drivers if scheduled_on_day(d,DAY_NAMES[(tgt.weekday()+1)%7])])
-        route_count=len(assignments["DOT"])+len(assignments["DOT-HelperRoute"])+len(assignments["XL"])
-        console.print(f"[{COLOR_HEADER}]📊 {day_label}: {route_count} routes assigned / {scheduled_count} scheduled drivers[/]")
-
-        rows=[{"Group":f"Routes assigned: {route_count}","Driver":""},
-              {"Group":f"Scheduled drivers: {scheduled_count}","Driver":""},
-              {"Group":"","Driver":""}]
-        for grp in ["DOT","DOT-HelperRoute","DOT-Helper","XL","Standby"]:
-            rows.append({"Group":f"{grp} ({len(assignments[grp])})","Driver":""})
-            for n in assignments[grp]: rows.append({"Group":"","Driver":n})
-            rows.append({"Group":"","Driver":""})
-        if assignments["Unassigned_New"]:
-            rows.append({"Group":"Unassigned (Need XL)","Driver":""})
-            for n in assignments["Unassigned_New"]:
-                rows.append({"Group":"","Driver":n})
-        df=pd.DataFrame(rows)
-        save_df_to_sheet(path,df,safe_sheet_name(day_label))
-        console.print("✅ Daily sheets updated")
-
-        # --- Fairness Enforcement & Console Logs ---
-    console.print(f"\n[{COLOR_HEADER}]⚖️ Starting fairness enforcement...[/]")
-
-    # Track DOT fairness and standby counts
-    unassigned_dots = [n for n, v in dot_stepvan_count.items() if v == 0]
-    standby_count = {name: sum(1 for dm in day_label_maps.values() if dm.get(name) == "Standby")
-                     for name in dot_map.keys()}
-
-    if unassigned_dots:
-        console.print(f"[yellow]⚠️ {len(unassigned_dots)} DOT-certified drivers did not drive a step van this week. Rebalancing...[/yellow]")
-        swaps = []
-        reassignments = []
-
-        for driver in unassigned_dots:
-            for day_idx, date_obj in enumerate(week_dates):
-                dname = DAY_NAMES[(date_obj.weekday() + 1) % 7]
-                try:
-                    driver_data = next(d for d in drivers if d["name"] == driver)
-                except StopIteration:
-                    continue
-                if scheduled_on_day(driver_data, dname):
-                    replacements = day_label_maps[day_idx]
-                    replaced = False
-                    for group in ["DOT", "DOT-HelperRoute"]:
-                        for assigned_driver, label in list(replacements.items()):
-                            if label in ["DOT", "DOT-HelperRoute"]:
-                                # Swap drivers
-                                replacements.pop(assigned_driver)
-                                replacements[driver] = group
-                                swaps.append((assigned_driver, driver, dname))
-                                dot_stepvan_count[driver] = 1
-
-                                # Reassign replaced driver (if scheduled that day)
-                                if scheduled_on_day(driver_data, dname):
-                                    if standby_count.get(assigned_driver, 0) < 2:
-                                        replacements[assigned_driver] = "Standby"
-                                        standby_count[assigned_driver] = standby_count.get(assigned_driver, 0) + 1
-                                        reassignments.append((assigned_driver, dname, "Standby"))
-                                    else:
-                                        # Skip if already at max standby
-                                        console.print(f"[dim]- {assigned_driver} already at Standby cap (2), skipped reassign[/dim]")
-                                replaced = True
-                                break
-                        if replaced:
-                            break
-                    if replaced:
-                        break
-
-        # Console logs
-        for a, b, d in swaps:
-            console.print(f"[green]→ Swapped {a} with {b} on {d}[/green]")
-        for n, d, grp in reassignments:
-            console.print(f"[cyan]↪ Reassigned {n} to {grp} on {d}[/cyan]")
-
-        console.print(f"[green]✅ Step-van fairness applied! ({len(swaps)} swaps, {len(reassignments)} reassignments)[/green]")
-    else:
-        console.print(f"[green]✅ Step-van fairness already satisfied![/green]")
-
-    console.print(f"[{COLOR_HEADER}]✅ Standby cap pass complete![/]")
-
-    # --- Fairness_Audit summary ---
-    console.print(f"[{COLOR_HEADER}]🧾 Adding Fairness_Audit sheet...[/]")
-    audit_rows = []
-    for day_idx, date_obj in enumerate(week_dates):
-        day_label = date_obj.strftime("%a %m_%d")
-        replacements = day_label_maps.get(day_idx, {})
-        for name, label in replacements.items():
-            if name in unassigned_dots and label in ["DOT", "DOT-HelperRoute"]:
-                audit_rows.append({"Driver": name, "Assigned Label": label, "Day": day_label})
-    if audit_rows:
-        audit_df = pd.DataFrame(audit_rows)
-        save_df_to_sheet(path, audit_df, safe_sheet_name("Fairness_Audit"))
-        console.print(f"[green]✅ Fairness_Audit sheet added successfully![/green]")
-    else:
-        console.print(f"[yellow]ℹ️ No fairness swaps were recorded for audit.[/yellow]")
-
-    # --- Refresh per-day sheets ---
-    console.print(f"[{COLOR_HEADER}]🔁 Updating per-day sheets after swaps...[/]")
-    for day_idx, date_obj in enumerate(week_dates):
-        day_label = date_obj.strftime("%a %m_%d")
-        assignments = {"DOT": [], "DOT-HelperRoute": [], "DOT-Helper": [], "XL": [], "Standby": []}
-        for name, label in day_label_maps.get(day_idx, {}).items():
-            if label in assignments:
-                assignments[label].append(name)
-
-        route_count = len(assignments["DOT"]) + len(assignments["DOT-HelperRoute"]) + len(assignments["XL"])
-        scheduled_count = len([d for d in drivers if scheduled_on_day(d, DAY_NAMES[day_idx])])
-        rows = [
-            {"Group": f"Routes assigned: {route_count}", "Driver": ""},
-            {"Group": f"Scheduled drivers: {scheduled_count}", "Driver": ""},
-            {"Group": "", "Driver": ""},
-        ]
-        for grp in ["DOT", "DOT-HelperRoute", "DOT-Helper", "XL", "Standby"]:
-            rows.append({"Group": f"{grp} ({len(assignments[grp])})", "Driver": ""})
-            for n in assignments[grp]:
-                rows.append({"Group": "", "Driver": n})
-            rows.append({"Group": "", "Driver": ""})
-        df = pd.DataFrame(rows)
-        save_df_to_sheet(path, df, safe_sheet_name(day_label))
-
-    console.print(f"[green]✅ All per-day sheets refreshed and fairness adjustments applied![/green]")
-
-
-    # --- Final workbook save and confirmation ---
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    base = os.path.splitext(os.path.basename(path))[0]
-    out = os.path.join(os.path.dirname(path), f"{base}_updated_with_assignments_{ts}.xlsx")
-    update_schedule_with_assignments(path, out, day_label_maps)
-
-    # Add "Generated on" note at the top of the first sheet
-    from openpyxl.utils import get_column_letter
-
-    wb = load_workbook(out)
-    ws = wb[wb.sheetnames[0]]
-    ws.insert_rows(1)  # Add a new top row
-    ws["A1"] = f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} – Baseline Version"
-    ws["A1"].font = ws["A1"].font.copy(bold=True)
-    safe_save_workbook(wb, out)
-    console.print(f"[green]📅 Added generation timestamp to '{out}'[/green]") 
-	
-    console.print(f"\n[{COLOR_HEADER}]✅ Weekly file saved successfully![/]")
-    console.print("\nNice work, Timmy! Week assigned and ready. 🚚💪😊",style=COLOR_TEXT)
-    input("\nPress Enter to exit...")
-
-if __name__=="__main__":
-    try:
-        main()
+        df = read_schedule_df(uploaded)
     except Exception as e:
-        import traceback
-        console.print("[bold red]Unexpected error:[/bold red]",str(e))
-        console.print(traceback.format_exc(),style="dim")
-        input("\nPress Enter to exit...")
+        st.error(f"Could not read Excel: {e}")
+        st.stop()
 
+    drivers = build_driver_records(df)
+    if not drivers:
+        st.error("No drivers parsed. Check Excel layout (rows 14–90, D–L).")
+        st.stop()
 
+    dot_map = infer_dot_map(drivers)
+    new_drivers = [x.strip() for x in new_drivers_text.split("\n") if x.strip()]
+    semi_restricted = [x.strip() for x in semi_text.split("\n") if x.strip()]
 
+    wk_start = week_start_from_weeknum(week_num)
+    week_dates = [wk_start + timedelta(days=i) for i in range(7)]
 
+    daily_counts = [counts[d] for d in DAY_NAMES]
 
+    progress.progress(5); st.session_state.progress_text.write("📥 Input loaded.")
+    day_assignments, swaps_log, day_summaries = generate_week(
+        drivers, dot_map, new_drivers, semi_restricted, week_dates, daily_counts
+    )
 
+    progress.progress(60); st.session_state.progress_text.write("🔁 Step-van fairness applied & Standby cap enforced.")
+
+    # --- UI: per-day panels
+    st.markdown("### Daily Assignments")
+    for idx, dt in enumerate(week_dates):
+        label = dt.strftime("%a %m/%d")
+        asg = day_assignments[idx]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            st.markdown(f"**🚛 DOT ({len(asg['DOT'])})**")
+            st.write("\n".join(asg["DOT"]) or "_none_")
+        with c2:
+            st.markdown(f"**🚐 DOT-HelperRoute ({len(asg['DOT-HelperRoute'])})**")
+            st.write("\n".join(asg["DOT-HelperRoute"]) or "_none_")
+        with c3:
+            st.markdown(f"**🧑‍🤝‍🧑 DOT-Helper ({len(asg['DOT-Helper'])})**")
+            st.write("\n".join(asg["DOT-Helper"]) or "_none_")
+        with c4:
+            st.markdown(f"**📦 XL ({len(asg['XL'])})**")
+            st.write("\n".join(asg["XL"]) or "_none_")
+        with c5:
+            st.markdown(f"**💤 Standby ({len(asg['Standby'])})**")
+            st.write("\n".join(asg["Standby"]) or "_none_")
+        st.caption(label)
+        st.divider()
+
+    progress.progress(80); st.session_state.progress_text.write("🧾 Building summary & workbook...")
+
+    # --- Summary table
+    st.markdown("### Weekly Summary (counts by day)")
+    summary_df = pd.DataFrame(day_summaries)
+    st.dataframe(summary_df, use_container_width=True)
+
+    # --- Fairness_Audit log
+    if swaps_log:
+        with st.expander("Fairness_Audit (swaps performed)"):
+            st.write("\n".join(swaps_log))
+
+    # --- Build colored Excel in-memory
+    buf = io.BytesIO()
+    write_colored_workbook(day_assignments, week_dates, swaps_log, buf)
+    progress.progress(100); st.session_state.progress_text.write("✅ All done! Ready to download.")
+
+    out_name = f"Week{int(week_num)}_Schedule.xlsx"
+    st.download_button(
+        label=f"⬇️ Download {out_name}",
+        data=buf.getvalue(),
+        file_name=out_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
 
