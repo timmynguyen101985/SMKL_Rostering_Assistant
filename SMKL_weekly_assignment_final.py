@@ -22,6 +22,7 @@ import time
 import warnings
 from datetime import datetime, timedelta, date
 import pandas as pd
+import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 # import tkinter as tk
@@ -29,7 +30,7 @@ from openpyxl.styles import PatternFill
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-import streamlit as st
+
 
 st.title("📘 SMKL Dispatch Assistant — Web Version")
 uploaded_file = st.file_uploader("Upload your weekly Excel schedule", type=["xlsx"])
@@ -87,14 +88,6 @@ ASSIGN_PRIORITY = ["DOT-HelperRoute","DOT","DOT-Helper","XL","Standby"]
 # =========================
 # 🗂️ UTILITIES
 # =========================
-def ask_for_workbook():
-    root = tk.Tk(); root.withdraw(); root.attributes("-topmost",True)
-    file = filedialog.askopenfilename(
-        title="Select weekly schedule workbook (rows 14–90, cols D–L)",
-        filetypes=[("Excel files","*.xlsx *.xls")]
-    )
-    root.destroy()
-    return file
 
 def safe_sheet_name(name):
     invalid = '[]:*?/\\'
@@ -290,11 +283,18 @@ def main():
     console.print(Markdown(f"```{banner}```"))
 
     console.print("\nSelect your weekly Excel schedule file (rows 14–90, cols D–L):",style=COLOR_TEXT)
-    path=ask_for_workbook()
+    uploaded_file = st.file_uploader("📘 Upload your weekly Excel schedule (rows 14–90, cols D–L):", type=["xlsx", "xls"])
+
+	if uploaded_file is None:
+    st.warning("Please upload a file to continue.")
+    st.stop()
+
+	path = uploaded_file
+
     if not path:
         console.print("[bold red]No file selected. Exiting.[/bold red]"); input(); return
 
-    df_raw,_=read_schedule_df(path)
+    df_raw = pd.read_excel(uploaded_file, header=None, skiprows=SKIPROWS, nrows=NROWS, engine="openpyxl")
     drivers=build_driver_records(df_raw)
     dot_map={d["name"]:infer_dot_cert(d) for d in drivers}
 
@@ -511,3 +511,4 @@ if __name__=="__main__":
         console.print("[bold red]Unexpected error:[/bold red]",str(e))
         console.print(traceback.format_exc(),style="dim")
         input("\nPress Enter to exit...")
+
