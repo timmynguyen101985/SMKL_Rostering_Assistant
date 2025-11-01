@@ -238,11 +238,13 @@ if uploaded:
                 cell = ws.cell(r, col)
                 v = cell.value
                 s = str(v).strip().lower() if v is not None else ""
-                if s in ("1", "dot"):  # scheduled cell
-                    label = day_label_maps.get(day_name, {}).get(name)
-                    if label:
-                        # Replace displayed text ONLY (do NOT change fill)
-                        cell.value = LABEL_TEXT.get(label, label)
+                # Always check if this driver has any assignment for that day
+                label = day_label_maps.get(day_name, {}).get(name)
+
+                # If driver is scheduled for that day (any assignment), update label
+                if label:
+                    cell.value = LABEL_TEXT.get(label, label)
+                # Otherwise, leave their cell untouched (don’t erase anything)
 
         st.success("✅ Weekly sheet updated (colors preserved).")
 
@@ -267,3 +269,4 @@ if uploaded:
         )
 else:
     st.info("👆 Upload your Excel file to start.")
+
