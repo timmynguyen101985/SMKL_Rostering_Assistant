@@ -3,8 +3,7 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from datetime import datetime, timedelta, date
-import io
-import random
+import io, random
 
 # ---------------------------------------------
 # App Title
@@ -12,7 +11,7 @@ import random
 st.set_page_config(page_title="SMKL Scheduling Assistant", layout="centered")
 st.markdown(
     """
-    <h1 style='text-align: center; color:#A3BE8C;'>
+    <h1 style='text-align:center; color:#A3BE8C;'>
         SMKL Scheduling Assistant — Designed by Timmy Nguyen 😎
     </h1>
     """,
@@ -23,14 +22,6 @@ st.markdown(
 # Constants & Colors
 # ---------------------------------------------
 DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-ASSIGN_COLORS = {
-    "DOT": "#81C784",
-    "DOT-Commingled": "#BA68C8",
-    "DOT-HelperRoute": "#AED581",
-    "DOT-Helper": "#4FC3F7",
-    "XL": "#FFF176",
-    "Standby": "#E0E0E0",
-}
 COLOR_FILL = {
     "DOT": PatternFill(start_color="C5E1A5", end_color="C5E1A5", fill_type="solid"),
     "DOT-Commingled": PatternFill(start_color="CE93D8", end_color="CE93D8", fill_type="solid"),
@@ -65,9 +56,6 @@ def scheduled_on_day(driver, day):
     v = driver["days"].get(day)
     return str(v).strip().lower() in ("1", "dot", "dot-commingled")
 
-def week_start_for(d: date):
-    return d - timedelta(days=(d.weekday() + 1) % 7)
-
 # ---------------------------------------------
 # User Inputs
 # ---------------------------------------------
@@ -75,19 +63,15 @@ week_input = st.number_input("📅 Enter the week number (e.g., 45):", min_value
 today_year = datetime.today().year
 wk_start = datetime.fromisocalendar(today_year, week_input, 1).date() - timedelta(days=1)
 week_dates = [wk_start + timedelta(days=i) for i in range(7)]
-st.info(f"📆 Week {week_input} detected: starting Sunday {wk_start}")
+st.info(f"📆 Week {week_input} detected – starting Sunday {wk_start}")
 
 dot_commingled_eligible = st.text_area("👷 Enter DOT-Commingled eligible drivers (one per line):").splitlines()
 new_drivers = st.text_area("🆕 Enter new drivers (for XL routes only, one per line):").splitlines()
 semi_drivers = st.text_area("🚫 Enter semi-restricted drivers (cannot do DOT/HelperRoute, one per line):").splitlines()
 
-# ---------------------------------------------
-# Read Workbook
-# ---------------------------------------------
 drivers = read_schedule(uploaded_file)
 dot_map = {d["name"]: any(str(v).strip().lower() == "dot" for v in d["days"].values()) for d in drivers}
 
-# Tracking
 dot_weekly_count = {n: 0 for n, is_dot in dot_map.items() if is_dot}
 dot_stepvan_count = {n: 0 for n, is_dot in dot_map.items() if is_dot}
 standby_tracker = {n: 0 for n in dot_map}
@@ -100,7 +84,7 @@ for tgt in week_dates:
     day_name = DAY_NAMES[(tgt.weekday() + 1) % 7]
     scheduled = [d["name"] for d in drivers if scheduled_on_day(d, day_name)]
 
-    # Inputs
+    # Input only DOT, DOT-Commingled, XL
     dot_routes = st.number_input(f"🚛 {day_name}: Number of DOT routes", min_value=0, value=4)
     comm_routes = st.number_input(f"🟣 {day_name}: Number of DOT-Commingled routes", min_value=0, value=2)
     xl_routes = st.number_input(f"📦 {day_name}: Number of XL routes", min_value=0, value=5)
@@ -108,16 +92,27 @@ for tgt in week_dates:
     eligible_dots = [n for n in scheduled if dot_map.get(n, False) and n not in semi_drivers]
     comm_eligible = [n for n in dot_commingled_eligible if n in scheduled]
 
-    # Assignments
     dot_assigned = random.sample(eligible_dots, min(dot_routes, len(eligible_dots)))
     comm_assigned = random.sample(comm_eligible, min(comm_routes, len(comm_eligible)))
-    helper_route = random.sample([n for n in eligible_dots if n not in dot_assigned], min(4, len(eligible_dots)))
-    helper = random.sample([n for n in scheduled if n not in dot_assigned + helper_route], min(4, len(scheduled)))
+
+    helper_route = random.sample(
+        [n for n in eligible_dots if n not in dot_assigned + comm_assigned],
+        min(4, len(eligible_dots)),
+    )
+    helper = random.sample(
+        [n for n in scheduled if n not in dot_assigned + comm_assigned + helper_route],
+        min(4, len(scheduled)),
+    )
+
     xl_assigned = [n for n in new_drivers if n in scheduled][:xl_routes]
 
-    standby = [n for n in scheduled if n not in set(dot_assigned + comm_assigned + helper_route + helper + xl_assigned)]
-    standby = [n for n in standby if standby_tracker[n] < 2][:max(0, len(standby) - 1)]
-    for s in standby: standby_tracker[s] += 1
+    standby = [
+        n for n in scheduled
+        if n not in set(dot_assigned + comm_assigned + helper_route + helper + xl_assigned)
+    ]
+    standby = [n for n in standby if standby_tracker[n] < 2]
+    for s in standby:
+        standby_tracker[s] += 1
 
     results[day_name] = {
         "DOT": dot_assigned,
@@ -129,10 +124,11 @@ for tgt in week_dates:
     }
 
 # ---------------------------------------------
-# Generate Workbook Output
+# Update Workbook
 # ---------------------------------------------
 wb = load_workbook(uploaded_file)
 ws = wb[wb.sheetnames[0]]
+
 for r in range(14, 91):
     first, last = ws.cell(r, 4).value, ws.cell(r, 5).value
     if not first and not last:
@@ -146,7 +142,9 @@ for r in range(14, 91):
                     ws.cell(r, 6 + i).value = k
                     ws.cell(r, 6 + i).fill = COLOR_FILL.get(k)
 
-# Save updated workbook
+# ---------------------------------------------
+# Export
+# ---------------------------------------------
 output = io.BytesIO()
 wb.save(output)
 output.seek(0)
